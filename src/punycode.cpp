@@ -2,6 +2,8 @@
 
 #include <cstdint>
 
+#include "ada/idna/utils.h"
+
 namespace ada::idna {
 
 constexpr int32_t base = 36;
@@ -19,7 +21,7 @@ static constexpr int32_t char_to_digit_value(char value) {
 }
 
 static constexpr char digit_to_char(int32_t digit) {
-  return digit < 26 ? digit + 97 : digit + 22;
+  return digit < 26 ? char(digit + 97) : char(digit + 22);
 }
 
 static constexpr int32_t adapt(int32_t d, int32_t n, bool firsttime) {
@@ -38,23 +40,19 @@ static constexpr int32_t adapt(int32_t d, int32_t n, bool firsttime) {
 }
 
 bool punycode_to_utf32(std::string_view input, std::u32string &out) {
-  size_t written_out{0};
+  int32_t written_out{0};
   out.reserve(out.size() + input.size());
   uint32_t n = initial_n;
   int32_t i = 0;
   int32_t bias = initial_bias;
-  // grab ascii content
-  size_t end_of_ascii = input.find_last_of('-');
-  if (end_of_ascii != std::string_view::npos) {
-    for (uint8_t c : input.substr(0, end_of_ascii)) {
-      if (c >= 0x80) {
-        return false;
-      }
-      out.push_back(c);
-      written_out++;
-    }
-    input.remove_prefix(end_of_ascii + 1);
+
+  if ((utils::begins_with(input, "xn--") || utils::begins_with(input, "XN--") ||
+       utils::begins_with(input, "Xn--") ||
+       utils::begins_with(input, "xN--"))) {
+    input.remove_prefix(5);
+    written_out += 5;
   }
+
   while (!input.empty()) {
     int32_t oldi = i;
     int32_t w = 1;
@@ -82,7 +80,7 @@ bool punycode_to_utf32(std::string_view input, std::u32string &out) {
       w = w * (base - t);
     }
     bias = adapt(i - oldi, written_out + 1, oldi == 0);
-    if (i / (written_out + 1) > 0x7fffffff - n) {
+    if (i / (written_out + 1) > int32_t(0x7fffffff - n)) {
       return false;
     }
     n = n + i / (written_out + 1);
@@ -100,20 +98,18 @@ bool punycode_to_utf32(std::string_view input, std::u32string &out) {
 
 bool verify_punycode(std::string_view input) {
   size_t written_out{0};
+
+  if ((utils::begins_with(input, "xn--") || utils::begins_with(input, "XN--") ||
+       utils::begins_with(input, "Xn--") ||
+       utils::begins_with(input, "xN--"))) {
+    input.remove_prefix(5);
+    written_out += 5;
+  }
+
   uint32_t n = initial_n;
   int32_t i = 0;
   int32_t bias = initial_bias;
-  // grab ascii content
-  size_t end_of_ascii = input.find_last_of('-');
-  if (end_of_ascii != std::string_view::npos) {
-    for (uint8_t c : input.substr(0, end_of_ascii)) {
-      if (c >= 0x80) {
-        return false;
-      }
-      written_out++;
-    }
-    input.remove_prefix(end_of_ascii + 1);
-  }
+
   while (!input.empty()) {
     int32_t oldi = i;
     int32_t w = 1;
@@ -140,12 +136,12 @@ bool verify_punycode(std::string_view input) {
       }
       w = w * (base - t);
     }
-    bias = adapt(i - oldi, written_out + 1, oldi == 0);
+    bias = adapt(i - oldi, int32_t(written_out + 1), oldi == 0);
     if (i / (written_out + 1) > 0x7fffffff - n) {
       return false;
     }
-    n = n + i / (written_out + 1);
-    i = i % (written_out + 1);
+    n = n + i / int32_t(written_out + 1);
+    i = i % int32_t(written_out + 1);
     if (n < 0x80) {
       return false;
     }
@@ -166,7 +162,7 @@ bool utf32_to_punycode(std::u32string_view input, std::string &out) {
   for (uint32_t c : input) {
     if (c < 0x80) {
       ++h;
-      out.push_back(c);
+      out.push_back(char(c));
     }
     if (c > 0x10ffff || (c >= 0xd880 && c < 0xe000)) {
       return false;
@@ -185,7 +181,7 @@ bool utf32_to_punycode(std::u32string_view input, std::string &out) {
     if ((m - n) > (0x7fffffff - d) / (h + 1)) {
       return false;
     }
-    d = d + (m - n) * (h + 1);
+    d = d + int32_t((m - n) * (h + 1));
     n = m;
     for (auto c : input) {
       if (c < n) {
@@ -206,7 +202,7 @@ bool utf32_to_punycode(std::u32string_view input, std::string &out) {
           q = (q - t) / (base - t);
         }
         out.push_back(digit_to_char(q));
-        bias = adapt(d, h + 1, h == b);
+        bias = adapt(d, int32_t(h + 1), h == b);
         d = 0;
         ++h;
       }

@@ -2,60 +2,101 @@
 
 #include <cstdint>
 
+#include "ada/idna/mapping.h"
+#include "ada/idna/normalization.h"
 #include "ada/idna/punycode.h"
 #include "ada/idna/unicode_transcoding.h"
+#include "ada/idna/utils.h"
+#include "ada/idna/validity.h"
 
 namespace ada::idna {
 
-bool begins_with(std::u32string_view view, std::u32string_view prefix) {
-  if (view.size() < prefix.size()) {
-    return false;
+template <typename T>
+inline bool is_ascii(T view) {
+  for (auto c : view) {
+    if (c >= 0x80) {
+      return false;
+    }
   }
-  return view.substr(0, prefix.size()) == prefix;
+  return true;
+}
+
+// We return "" on error. For now.
+static std::string from_ascii_to_ascii(std::string_view ut8_string) {
+  static const std::string error = "";
+  // copy and map
+  // we could be more efficient by avoiding the copy when unnecessary.
+  std::string mapped_string = std::string(ut8_string);
+  ascii_map(mapped_string.data(), mapped_string.size());
+  std::string out;
+  size_t label_start = 0;
+
+  while (label_start != mapped_string.size()) {
+    size_t loc_dot = mapped_string.find('.', label_start);
+    bool is_last_label = (loc_dot == std::string_view::npos);
+    size_t label_size = is_last_label ? mapped_string.size() - label_start
+                                      : loc_dot - label_start;
+    size_t label_size_with_dot = is_last_label ? label_size : label_size + 1;
+    std::string_view label_view(mapped_string.data() + label_start, label_size);
+    label_start += label_size_with_dot;
+    if (label_size == 0) {
+      // empty label? Nothing to do.
+    } else if (utils::begins_with(label_view, "xn--")) {
+      // The xn-- part is the expensive game.
+      out.append(label_view);
+      std::string_view puny_segment_ascii(
+          out.data() + out.size() - label_view.size() + 4,
+          label_view.size() - 4);
+      std::u32string tmp_buffer;
+      bool is_ok = ada::idna::punycode_to_utf32(puny_segment_ascii, tmp_buffer);
+      if (!is_ok) {
+        return error;
+      }
+      std::u32string post_map = ada::idna::map(tmp_buffer);
+      if (tmp_buffer != post_map) {
+        return error;
+      }
+      std::u32string pre_normal = post_map;
+      normalize(post_map);
+      if (post_map != pre_normal) {
+        return error;
+      }
+      if (post_map.empty()) {
+        return error;
+      }
+      if (!is_label_valid(post_map)) {
+        return error;
+      }
+    } else {
+      out.append(label_view);
+    }
+    if (!is_last_label) {
+      out.push_back('.');
+    }
+  }
+  return out;
 }
 
 // We return "" on error. For now.
 std::string to_ascii(std::string_view ut8_string) {
-  // If the string is pure ascii, then **we do not need** to convert to
-  // UTF-32 and could use a faster path where we only do verify_punycode
-  // where needed. Though we may need to do mapping and check for
-  // forbidden characters.
+  if (is_ascii(ut8_string)) {
+    return from_ascii_to_ascii(ut8_string);
+  }
   static const std::string error = "";
   // We convert to UTF-32
   size_t utf32_length =
       ada::idna::utf32_length_from_utf8(ut8_string.data(), ut8_string.size());
   std::u32string utf32(utf32_length, '\0');
-  // To do: utf8_to_utf32 will return zero if the input is invalid
-  // UTF-8, we should check.
-  ada::idna::utf8_to_utf32(ut8_string.data(), ut8_string.size(), utf32.data());
-
-  // Here we would do extra work such as mapping and so forth. Here is
-  // what we need to do:
-  //
-  //  * [Map](https://www.unicode.org/reports/tr46/#ProcessingStepMap).
-  //  For each code point in the domain_name string, look up the status
-  //  value in Section 5, [IDNA Mapping
-  //  Table](https://www.unicode.org/reports/tr46/#IDNA_Mapping_Table),
-  //  and take the following actions:
-  //    * disallowed: Leave the code point unchanged in the string, and
-  //    record that there was an error.
-  //    * ignored: Remove the code point from the string. This is
-  //    equivalent to mapping the code point to an empty string.
-  //    * mapped: Replace the code point in the string by the value for
-  //    the mapping in Section 5, [IDNA Mapping
-  //    Table](https://www.unicode.org/reports/tr46/#IDNA_Mapping_Table).
-  //    * valid: Leave the code point unchanged in the string.
-  //  * [Normalize](https://www.unicode.org/reports/tr46/#ProcessingStepNormalize). Normalize
-  //     the domain_name string to Unicode Normalization Form C. See
-  //     https://dev.w3.org/cvsweb/charlint/charlint.pl?rev=1.28;content-type=text%2Fplain
-  //     for a Perl script that does it.
-  ////////////////////////////////////////////////////
-  // TODO: Implement mapping *and* normalization.
-  ////////////////////////////////////////////////////
+  size_t actual_utf32_length = ada::idna::utf8_to_utf32(
+      ut8_string.data(), ut8_string.size(), utf32.data());
+  if (actual_utf32_length == 0) {
+    return error;
+  }
+  // mapping
+  utf32 = ada::idna::map(utf32);
+  normalize(utf32);
   std::string out;
   size_t label_start = 0;
-  //  * [Break](https://www.unicode.org/reports/tr46/#ProcessingStepBreak).
-  //  Break the string into labels at U+002E ( . ) FULL STOP.
 
   while (label_start != utf32.size()) {
     size_t loc_dot = utf32.find('.', label_start);
@@ -65,60 +106,59 @@ std::string to_ascii(std::string_view ut8_string) {
     size_t label_size_with_dot = is_last_label ? label_size : label_size + 1;
     std::u32string_view label_view(utf32.data() + label_start, label_size);
     label_start += label_size_with_dot;
-
     if (label_size == 0) {
       // empty label? Nothing to do.
-    } else if (begins_with(label_view, U"xn--") ||
-               begins_with(label_view, U"XN--") ||
-               begins_with(label_view, U"Xn--") ||
-               begins_with(label_view, U"xN--")) {
-      //    * [If the label starts with
-      //    “xn--”](https://www.unicode.org/reports/tr46/#ProcessingStepPunycode):
-      //      * Attempt to convert the rest of the label
-      //      to Unicode according to Punycode [[RFC3492
-      //      (https://www.unicode.org/reports/tr46/#RFC3492)].
-      //      If that conversion fails, record that
-      //      there was an error, and continue with the
-      //      next label. Otherwise replace the original
-      //      label in the string by the results of the
-      //      conversion.
-      //      * Verify that the label meets the validity
-      //      criteria in Section 4.1, [Validity
-      //      Criteria](https://www.unicode.org/reports/tr46/#Validity_Criteria)
-      //      for Nontransitional Processing. If any of
-      //      the validity criteria are not satisfied,
-      //      record that there was an error.
-      ////////////////////////////////////////////////////
-      // TODO: current code merely verifies that we have
-      // proper punycode. But we should decode and
-      // verify the cotent.
-      ////////////////////////////////////////////////////
+    } else if (utils::begins_with(label_view, U"xn--")) {
+      // we do not need to check, e.g., Xn-- because mapping goes to lower case
       for (char32_t c : label_view) {
         if (c >= 0x80) {
           return error;
         }
         out += (unsigned char)(c);
       }
-      std::string_view puny_segment_ascii(out.data() - label_view.size() + 4,
-                                          label_view.size() - 4);
-      if (!ada::idna::verify_punycode(puny_segment_ascii)) {
+      std::string_view puny_segment_ascii(
+          out.data() + out.size() - label_view.size() + 4,
+          label_view.size() - 4);
+      std::u32string tmp_buffer;
+      bool is_ok = ada::idna::punycode_to_utf32(puny_segment_ascii, tmp_buffer);
+      if (!is_ok) {
+        return error;
+      }
+      std::u32string post_map = ada::idna::map(tmp_buffer);
+      if (tmp_buffer != post_map) {
+        return error;
+      }
+      std::u32string pre_normal = post_map;
+      normalize(post_map);
+      if (post_map != pre_normal) {
+        return error;
+      }
+      if (post_map.empty()) {
+        return error;
+      }
+      if (!is_label_valid(post_map)) {
         return error;
       }
     } else {
-      //    * [If the label does not start with
-      //    “xn--”](https://www.unicode.org/reports/tr46/#ProcessingStepNonPunycode):
-      //  Verify that the label meets the validity
-      //  criteria in Section 4.1, [Validity
-      //  Criteria](https://www.unicode.org/reports/tr46/#Validity_Criteria)
-      //  for the input Processing choice (Transitional
-      //  or Nontransitional). If any of the validity
-      //  criteria are not satisfied, record that there
-      //  was an error.
-      ////////////////////////////////////////////////////
-      // TODO: current code merely encodes to punycode
-      // but we should also check the validity criteria.
-      ////////////////////////////////////////////////////
-      ada::idna::utf32_to_punycode(label_view, out);
+      // The fast path here is an ascii label.
+      if (is_ascii(label_view)) {
+        // no validation needed.
+        for (char32_t c : label_view) {
+          out += (unsigned char)(c);
+        }
+      } else {
+        // slow path.
+        // first check validity.
+        if (!is_label_valid(label_view)) {
+          return error;
+        }
+        // It is valid! So now we must encode it as punycode...
+        out.append("xn--");
+        bool is_ok = ada::idna::utf32_to_punycode(label_view, out);
+        if (!is_ok) {
+          return error;
+        }
+      }
     }
     if (!is_last_label) {
       out.push_back('.');
